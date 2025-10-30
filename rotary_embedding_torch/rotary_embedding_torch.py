@@ -8,7 +8,7 @@ from torch import nn, einsum, broadcast_tensors, is_tensor, tensor, Tensor
 
 from einops import rearrange, repeat
 
-from typing import Literal
+from typing import Literal, Optional
 
 # helper functions
 
@@ -47,6 +47,19 @@ def apply_rotary_emb(
     seq_dim = -2,
     freqs_seq_dim = None
 ):
+    """Apply rotary embedding to a target tensor
+
+    Args:
+        freqs (_type_): _description_
+        t (_type_): _description_
+        start_index (int, optional): _description_. Defaults to 0.
+        scale (_type_, optional): _description_. Defaults to 1..
+        seq_dim (int, optional): _description_. Defaults to -2.
+        freqs_seq_dim (_type_, optional): _description_. Defaults to None.
+
+    Returns:
+        _type_: _description_
+    """
     dtype = t.dtype
 
     if not exists(freqs_seq_dim):
@@ -168,24 +181,56 @@ class RotaryEmbedding(Module):
     def device(self):
         return self.dummy.device
 
-    def get_seq_pos(self, seq_len, device = None, dtype = None, offset = 0):
+    def get_seq_pos(self, seq_len: int, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None, offset: int = 0, norm_length: Optional[int] = None):
+        """Get the index tensor of the sequence
+
+        Args:
+            seq_len (int): The length of the sequence
+            device (Optional[torch.device], optional): The device to create the tensor on. Defaults to None.
+            dtype (Optional[torch.dtype], optional): The data type of the tensor. Defaults to None.
+            offset (int, optional): The offset to apply to the sequence indices. Defaults to 0.
+            norm_length (Optional[int], optional): The normalized length of the sequence (i.e. the max sequence). Defaults to None.
+
+        Returns:
+            torch.Tensor: The index tensor of the sequence.
+        """
         device = default(device, self.device)
         dtype = default(dtype, self.cached_freqs.dtype)
+        
+        if not exists(norm_length):
+            return (torch.arange(seq_len, device = device, dtype = dtype) + offset) / self.interpolate_factor
+        else:
+            assert norm_length >= seq_len, 'normalized length must be greater than or equal to sequence length'
+            base_indices = torch.arange(seq_len, device = device, dtype = dtype)
+            normalized_indices = base_indices * (norm_length / seq_len)
+            return (normalized_indices + offset)
 
-        return (torch.arange(seq_len, device = device, dtype = dtype) + offset) / self.interpolate_factor
 
-    def rotate_queries_or_keys(self, t, seq_dim = None, offset = 0, scale = None):
+    def rotate_queries_or_keys(self, t: torch.Tensor, seq_dim: int = None, offset: int = 0, scale: float = None, norm_length: Optional[int] = None):
+        """Rotate a sequence using RoPE
+
+        Args:
+            t (torch.Tensor): The input tensor to rotate.
+            seq_dim (int, optional): The index of the specific dimension in the input tensor that is the sequence dimension. Defaults to None.
+            offset (int, optional): The offset to apply to the sequence indices. Defaults to 0.
+            scale (float, optional): The scale factor to apply. Defaults to None.
+            norm_length (Optional[int], optional): The normalized length of the sequence. Defaults to None.
+
+        Returns:
+            _type_: _description_
+        """
         seq_dim = default(seq_dim, self.default_seq_dim)
 
         assert not self.use_xpos or exists(scale), 'you must use `.rotate_queries_and_keys` method instead and pass in both queries and keys, for length extrapolatable rotary embeddings'
 
         device, dtype, seq_len = t.device, t.dtype, t.shape[seq_dim]
 
-        seq = self.get_seq_pos(seq_len, device = device, dtype = dtype, offset = offset)
+        seq = self.get_seq_pos(seq_len, device = device, dtype = dtype, offset = offset, norm_length = norm_length)
 
-        freqs = self.forward(seq, seq_len = seq_len, offset = offset)
+        freqs = self.forward(seq, seq_len = seq_len, offset = offset) # sequence_len, embedding_dim // n_heads
 
         if seq_dim == -3:
+            # for the case of B, sequence_len, head_dim, embedding_dim // n_heads
             freqs = rearrange(freqs, 'n d -> n 1 d')
 
         return apply_rotary_emb(freqs, t, scale = default(scale, 1.), seq_dim = seq_dim)
@@ -277,6 +322,14 @@ class RotaryEmbedding(Module):
             None
         ) = None
     ):
+        """_summary_
+
+        Args:
+            offsets (tuple[int  |  float, ...]  |  Tensor  |  None, optional): _description_. Defaults to None.
+
+        Returns:
+            _type_: _description_
+        """
         Colon = slice(None)
         all_freqs = []
 
